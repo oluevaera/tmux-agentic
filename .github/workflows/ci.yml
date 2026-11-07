@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      # The live tests drive real tmux servers: Ubuntu's apt has 3.4, Homebrew the latest.
+      - run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install tmux; else sudo apt-get update -q && sudo apt-get install -yq tmux; fi
+          tmux -V
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: shellcheck agentic.tmux

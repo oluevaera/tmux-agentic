@@ -1,0 +1,86 @@
+name: Release
+
+# By hand only: Actions → Release → Run workflow (or `gh workflow run release.yml`), from main. Nothing releases on a
+# push, a merge or a tag; the workflow makes the tag itself.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      # The tag is Cargo.toml's version, which is what agentic.tmux downloads; a version released already stops here.
+      - id: version
+        run: |
+          tag="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "$tag is released already: raise version in Cargo.toml first" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - run: cargo test --locked --bins
+      - run: gh release create "${{ steps.version.outputs.tag }}" --target "$GITHUB_SHA" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: release
+    strategy:
+      matrix:
+        include: # asset names are agentic-$(uname -s)-$(uname -m)
+          - { os: macos-latest, target: aarch64-apple-darwin, asset: agentic-Darwin-arm64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, asset: agentic-Darwin-x86_64 }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, asset: agentic-Linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, asset: agentic-Linux-aarch64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      # The checksum beside it: agentic.tmux runs a download only if it matches.
+      - run: |
+          cp target/${{ matrix.target }}/release/agentic ${{ matrix.asset }}
+          shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          gh release upload "$TAG" ${{ matrix.asset }} ${{ matrix.asset }}.sha256
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+
+  # The branch TPM installs: agentic.tmux with this release's version written in, and nothing to build. It moves only
+  # once every build is uploaded, so a plugin update never asks for a release that isn't all there yet.
+  release-branch:
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          version=${TAG#v}
+          out=$(mktemp -d)
+          cp agentic.tmux README.md "$out/"
+          [ ! -f LICENSE ] || cp LICENSE "$out/"
+          printf 'bin/\n' > "$out/.gitignore" # the downloaded build
+          sed -i "s/^version=\$/version=$version/" "$out/agentic.tmux"
+          grep -qx "version=$version" "$out/agentic.tmux"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git ls-remote --exit-code --heads origin release >/dev/null; then
+            git switch -C release origin/release
+          else
+            git switch --orphan release
+          fi
+          git rm -rfq --ignore-unmatch .
+          cp -a "$out/." .
+          git add -A
+          git commit -qm "$TAG"
+          git push origin release
